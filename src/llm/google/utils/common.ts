@@ -119,6 +119,23 @@ function inferToolNameFromPreviousMessages(
     })?.name;
 }
 
+function findToolCallFromPreviousMessages(
+  message: ToolMessage | ToolMessageChunk,
+  previousMessages: BaseMessage[]
+): any | undefined {
+  return previousMessages
+    .map((msg) => {
+      if (isAIMessage(msg)) {
+        return msg.tool_calls ?? [];
+      }
+      return [];
+    })
+    .flat()
+    .find((toolCall) => {
+      return toolCall.id === message.tool_call_id;
+    });
+}
+
 function _getStandardContentBlockConverter(
   isMultimodalModel: boolean
 ): StandardContentBlockConverter<{
@@ -364,6 +381,10 @@ export function convertMessageContentToParts(
       );
     }
 
+    // Find the original tool call to get the thought_signature
+    const originalToolCall = findToolCallFromPreviousMessages(message, previousMessages);
+    const thoughtSignature = originalToolCall?.thought_signature;
+
     const result = Array.isArray(message.content)
       ? (message.content
         .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
@@ -371,27 +392,33 @@ export function convertMessageContentToParts(
       : message.content;
 
     if (message.status === 'error') {
-      return [
-        {
-          functionResponse: {
-            name: messageName,
-            // The API expects an object with an `error` field if the function call fails.
-            // `error` must be a valid object (not a string or array), so we wrap `message.content` here
-            response: { error: { details: result } },
-          },
-        },
-      ];
-    }
-
-    return [
-      {
+      const errorPart: any = {
         functionResponse: {
           name: messageName,
-          // again, can't have a string or array value for `response`, so we wrap it as an object here
-          response: { result },
+          // The API expects an object with an `error` field if the function call fails.
+          // `error` must be a valid object (not a string or array), so we wrap `message.content` here
+          response: { error: { details: result } },
         },
+      };
+      // Include thought_signature if it exists (required for Gemini 3)
+      if (thoughtSignature) {
+        errorPart.thought_signature = thoughtSignature;
+      }
+      return [errorPart];
+    }
+
+    const responsePart: any = {
+      functionResponse: {
+        name: messageName,
+        // again, can't have a string or array value for `response`, so we wrap it as an object here
+        response: { result },
       },
-    ];
+    };
+    // Include thought_signature if it exists (required for Gemini 3)
+    if (thoughtSignature) {
+      responsePart.thought_signature = thoughtSignature;
+    }
+    return [responsePart];
   }
 
   let functionCalls: FunctionCallPart[] = [];
@@ -410,13 +437,35 @@ export function convertMessageContentToParts(
   }
 
   if (isAIMessage(message) && message.tool_calls?.length != null) {
-    functionCalls = message.tool_calls.map((tc) => {
-      return {
+    console.log('[GEMINI-DEBUG] Converting AI message tool_calls to parts:');
+    console.log('[GEMINI-DEBUG] additional_kwargs keys:', Object.keys(message.additional_kwargs || {}));
+
+    // Retrieve thoughtSignatures from additional_kwargs (where we stored them)
+    const thoughtSignatures = (message.additional_kwargs as any)?.thoughtSignatures || {};
+    console.log('[GEMINI-DEBUG] Retrieved thoughtSignatures:', Object.keys(thoughtSignatures));
+
+    functionCalls = message.tool_calls.map((tc: any, index: number) => {
+      console.log(`[GEMINI-DEBUG] Tool call ${index}:`, {
+        name: tc.name,
+        has_thought_signature: !!tc.thought_signature,
+        tool_call_keys: Object.keys(tc),
+      });
+      const part: any = {
         functionCall: {
           name: tc.name,
           args: tc.args,
         },
       };
+
+      // Retrieve thoughtSignature from additional_kwargs by function name
+      const thoughtSig = thoughtSignatures[tc.name];
+      if (thoughtSig) {
+        console.log(`[GEMINI-DEBUG] Adding thoughtSignature to part for ${tc.name}`);
+        part.thoughtSignature = thoughtSig;
+      } else {
+        console.log(`[GEMINI-DEBUG] WARNING: No thoughtSignature found for ${tc.name}`);
+      }
+      return part;
     });
   }
 
@@ -586,6 +635,22 @@ export function convertResponseContentToChatGenerationChunk(
 
   if (candidate?.groundingMetadata) {
     additional_kwargs.groundingMetadata = candidate.groundingMetadata;
+  }
+
+  // Store thoughtSignatures for function calls
+  // LangChain strips custom properties from tool_calls, so we store in additional_kwargs
+  if (functionCalls && candidateContent?.parts) {
+    const thoughtSignatures: Record<string, string> = {};
+    candidateContent.parts.forEach((part: any) => {
+      if (part.functionCall && part.thoughtSignature) {
+        // Use function name as key (assumes unique names in a single response)
+        thoughtSignatures[part.functionCall.name] = part.thoughtSignature;
+      }
+    });
+    if (Object.keys(thoughtSignatures).length > 0) {
+      additional_kwargs.thoughtSignatures = thoughtSignatures;
+      console.log('[GEMINI-DEBUG] Stored thoughtSignatures in additional_kwargs:', Object.keys(thoughtSignatures));
+    }
   }
 
   const isFinalChunk =
