@@ -437,19 +437,10 @@ export function convertMessageContentToParts(
   }
 
   if (isAIMessage(message) && message.tool_calls?.length != null) {
-    console.log('[GEMINI-DEBUG] Converting AI message tool_calls to parts:');
-    console.log('[GEMINI-DEBUG] additional_kwargs keys:', Object.keys(message.additional_kwargs || {}));
-
     // Retrieve thoughtSignatures from additional_kwargs (where we stored them)
     const thoughtSignatures = (message.additional_kwargs as any)?.thoughtSignatures || {};
-    console.log('[GEMINI-DEBUG] Retrieved thoughtSignatures:', Object.keys(thoughtSignatures));
 
-    functionCalls = message.tool_calls.map((tc: any, index: number) => {
-      console.log(`[GEMINI-DEBUG] Tool call ${index}:`, {
-        name: tc.name,
-        has_thought_signature: !!tc.thought_signature,
-        tool_call_keys: Object.keys(tc),
-      });
+    functionCalls = message.tool_calls.map((tc: any) => {
       const part: any = {
         functionCall: {
           name: tc.name,
@@ -460,10 +451,7 @@ export function convertMessageContentToParts(
       // Retrieve thoughtSignature from additional_kwargs by function name
       const thoughtSig = thoughtSignatures[tc.name];
       if (thoughtSig) {
-        console.log(`[GEMINI-DEBUG] Adding thoughtSignature to part for ${tc.name}`);
         part.thoughtSignature = thoughtSig;
-      } else {
-        console.log(`[GEMINI-DEBUG] WARNING: No thoughtSignature found for ${tc.name}`);
       }
       return part;
     });
@@ -649,7 +637,6 @@ export function convertResponseContentToChatGenerationChunk(
     });
     if (Object.keys(thoughtSignatures).length > 0) {
       additional_kwargs.thoughtSignatures = thoughtSignatures;
-      console.log('[GEMINI-DEBUG] Stored thoughtSignatures in additional_kwargs:', Object.keys(thoughtSignatures));
     }
   }
 

@@ -107,6 +107,15 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     this.streamUsage = fields.streamUsage ?? this.streamUsage;
   }
 
+  get _isMultimodalModel() {
+    return (
+      this.model.includes('vision') ||
+      this.model.startsWith('gemini-1.5') ||
+      this.model.startsWith('gemini-2') ||
+      this.model.startsWith('gemini-3')
+    );
+  }
+
   static lc_name(): 'LibreChatGoogleGenerativeAI' {
     return 'LibreChatGoogleGenerativeAI';
   }
