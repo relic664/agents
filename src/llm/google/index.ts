@@ -11,15 +11,30 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiGenerationConfig } from '@langchain/google-common';
-import type { GeminiApiUsageMetadata } from './types';
+import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
+  mapGenerateContentResultToChatResult,
 } from './utils/common';
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+
+  /**
+   * Override to add gemini-3 model support for multimodal and function calling thought signatures
+   */
+  get _isMultimodalModel(): boolean {
+    return (
+      this.model.startsWith('gemini-1.5') ||
+      this.model.startsWith('gemini-2') ||
+      (this.model.startsWith('gemma-3-') &&
+        !this.model.startsWith('gemma-3-1b')) ||
+      this.model.startsWith('gemini-3')
+    );
+  }
+
   constructor(fields: GoogleClientOptions) {
     super(fields);
 
@@ -111,6 +126,59 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     return 'LibreChatGoogleGenerativeAI';
   }
 
+  /**
+   * Helper function to convert Gemini API usage metadata to LangChain format
+   * Includes support for cached tokens and tier-based tracking for gemini-3-pro-preview
+   */
+  private _convertToUsageMetadata(
+    usageMetadata: GeminiApiUsageMetadata | undefined,
+    model: string
+  ): UsageMetadata | undefined {
+    if (!usageMetadata) {
+      return undefined;
+    }
+
+    const output: UsageMetadata = {
+      input_tokens: usageMetadata.promptTokenCount ?? 0,
+      output_tokens:
+        (usageMetadata.candidatesTokenCount ?? 0) +
+        (usageMetadata.thoughtsTokenCount ?? 0),
+      total_tokens: usageMetadata.totalTokenCount ?? 0,
+    };
+
+    if (usageMetadata.cachedContentTokenCount) {
+      output.input_token_details ??= {};
+      output.input_token_details.cache_read =
+        usageMetadata.cachedContentTokenCount;
+    }
+
+    // gemini-3-pro-preview has bracket based tracking of tokens per request
+    if (model === 'gemini-3-pro-preview') {
+      const over200k = Math.max(
+        0,
+        (usageMetadata.promptTokenCount ?? 0) - 200000
+      );
+      const cachedOver200k = Math.max(
+        0,
+        (usageMetadata.cachedContentTokenCount ?? 0) - 200000
+      );
+      if (over200k) {
+        output.input_token_details = {
+          ...output.input_token_details,
+          over_200k: over200k,
+        } as InputTokenDetails;
+      }
+      if (cachedOver200k) {
+        output.input_token_details = {
+          ...output.input_token_details,
+          cache_read_over_200k: cachedOver200k,
+        } as InputTokenDetails;
+      }
+    }
+
+    return output;
+  }
+
   invocationParams(
     options?: this['ParsedCallOptions']
   ): Omit<GenerateContentRequest, 'contents'> {
@@ -127,6 +195,60 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     return params;
   }
 
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<import('@langchain/core/outputs').ChatResult> {
+    const prompt = convertBaseMessagesToContent(
+      messages,
+      this._isMultimodalModel,
+      this.useSystemInstruction,
+      this.model
+    );
+    let actualPrompt = prompt;
+    if (prompt?.[0].role === 'system') {
+      const [systemInstruction] = prompt;
+      /** @ts-ignore */
+      this.client.systemInstruction = systemInstruction;
+      actualPrompt = prompt.slice(1);
+    }
+    const parameters = this.invocationParams(options);
+    const request = {
+      ...parameters,
+      contents: actualPrompt,
+    };
+
+    const res = await this.caller.callWithOptions(
+      { signal: options.signal },
+      async () =>
+        /** @ts-ignore */
+        this.client.generateContent(request)
+    );
+
+    const response = res.response;
+    const usageMetadata = this._convertToUsageMetadata(
+      /** @ts-ignore */
+      response.usageMetadata,
+      this.model
+    );
+
+    /** @ts-ignore */
+    const generationResult = mapGenerateContentResultToChatResult(response, {
+      usageMetadata,
+    });
+
+    await runManager?.handleLLMNewToken(
+      generationResult.generations[0].text || '',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined
+    );
+    return generationResult;
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -135,7 +257,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     const prompt = convertBaseMessagesToContent(
       messages,
       this._isMultimodalModel,
-      this.useSystemInstruction
+      this.useSystemInstruction,
+      this.model
     );
     let actualPrompt = prompt;
     if (prompt?.[0].role === 'system') {
@@ -166,18 +289,10 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         this.streamUsage !== false &&
         options.streamUsage !== false
       ) {
-        const genAIUsageMetadata = response.usageMetadata as
-          | GeminiApiUsageMetadata
-          | undefined;
-
-        const output_tokens =
-          (genAIUsageMetadata?.candidatesTokenCount ?? 0) +
-          (genAIUsageMetadata?.thoughtsTokenCount ?? 0);
-        lastUsageMetadata = {
-          input_tokens: genAIUsageMetadata?.promptTokenCount ?? 0,
-          output_tokens,
-          total_tokens: genAIUsageMetadata?.totalTokenCount ?? 0,
-        };
+        lastUsageMetadata = this._convertToUsageMetadata(
+          response.usageMetadata as GeminiApiUsageMetadata | undefined,
+          this.model
+        );
       }
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {

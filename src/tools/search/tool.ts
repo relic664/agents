@@ -1,15 +1,16 @@
-import { z } from 'zod';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from './types';
 import {
-  DATE_RANGE,
-  querySchema,
-  dateSchema,
+  WebSearchToolDescription,
+  WebSearchToolName,
   countrySchema,
   imagesSchema,
   videosSchema,
+  querySchema,
+  dateSchema,
   newsSchema,
+  DATE_RANGE,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
@@ -269,12 +270,13 @@ function createTool({
   search,
   onSearchResults: _onSearchResults,
 }: {
-  schema: t.SearchToolSchema;
+  schema: Record<string, unknown>;
   search: ReturnType<typeof createSearchProcessor>;
   onSearchResults: t.SearchToolConfig['onSearchResults'];
-}): DynamicStructuredTool<typeof schema> {
-  return tool<typeof schema>(
-    async (params, runnableConfig) => {
+}): DynamicStructuredTool {
+  return tool(
+    async (rawParams, runnableConfig) => {
+      const params = rawParams as SearchToolParams;
       const { query, date, country: _c, images, videos, news } = params;
       const country = typeof _c === 'string' && _c ? _c : undefined;
       const searchResult = await search({
@@ -295,30 +297,8 @@ function createTool({
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
     {
-      name: Constants.WEB_SEARCH,
-      description: `Real-time search. Results have required citation anchors.
-
-Note: Use ONCE per reply unless instructed otherwise.
-
-Anchors:
-- \\ue202turnXtypeY
-- X = turn idx, type = 'search' | 'news' | 'image' | 'ref', Y = item idx
-
-Special Markers:
-- \\ue203...\\ue204 — highlight start/end of cited text (for Standalone or Group citations)
-- \\ue200...\\ue201 — group block (e.g. \\ue200\\ue202turn0search1\\ue202turn0news2\\ue201)
-
-**CITE EVERY NON-OBVIOUS FACT/QUOTE:**
-Use anchor marker(s) immediately after the statement:
-- Standalone: "Pure functions produce same output. \\ue202turn0search0"
-- Standalone (multiple): "Today's News \\ue202turn0search0\\ue202turn0news0"
-- Highlight: "\\ue203Highlight text.\\ue204\\ue202turn0news1"
-- Group: "Sources. \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
-- Group Highlight: "\\ue203Highlight for group.\\ue204 \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
-- Image: "See photo \\ue202turn0image0."
-
-**NEVER use markdown links, [1], or footnotes. CITE ONLY with anchors provided.**
-`.trim(),
+      name: WebSearchToolName,
+      description: WebSearchToolDescription,
       schema: schema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
@@ -353,9 +333,19 @@ Use anchor marker(s) immediately after the statement:
  * @param config - The search tool configuration
  * @returns A DynamicStructuredTool with a schema that depends on the searchProvider
  */
+/** Input params type for search tool */
+interface SearchToolParams {
+  query: string;
+  date?: DATE_RANGE;
+  country?: string;
+  images?: boolean;
+  videos?: boolean;
+  news?: boolean;
+}
+
 export const createSearchTool = (
   config: t.SearchToolConfig = {}
-): DynamicStructuredTool<typeof toolSchema> => {
+): DynamicStructuredTool => {
   const {
     searchProvider = 'serper',
     serperApiKey,
@@ -382,14 +372,7 @@ export const createSearchTool = (
 
   const logger = config.logger || createDefaultLogger();
 
-  const schemaObject: {
-    query: z.ZodString;
-    date: z.ZodOptional<z.ZodNativeEnum<typeof DATE_RANGE>>;
-    country?: z.ZodOptional<z.ZodString>;
-    images: z.ZodOptional<z.ZodBoolean>;
-    videos: z.ZodOptional<z.ZodBoolean>;
-    news: z.ZodOptional<z.ZodBoolean>;
-  } = {
+  const schemaProperties: Record<string, unknown> = {
     query: querySchema,
     date: dateSchema,
     images: imagesSchema,
@@ -398,10 +381,14 @@ export const createSearchTool = (
   };
 
   if (searchProvider === 'serper') {
-    schemaObject.country = countrySchema;
+    schemaProperties.country = countrySchema;
   }
 
-  const toolSchema = z.object(schemaObject);
+  const toolSchema = {
+    type: 'object',
+    properties: schemaProperties,
+    required: ['query'],
+  };
 
   const searchAPI = createSearchAPI({
     searchProvider,

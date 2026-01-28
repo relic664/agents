@@ -363,6 +363,90 @@ function _formatContent(message: BaseMessage) {
     return content;
   } else {
     const contentBlocks = content.map((contentPart) => {
+      /**
+       * Handle malformed blocks that have server tool fields mixed with text type.
+       * These can occur when server_tool_use blocks get mislabeled during aggregation.
+       * Correct their type ONLY if we can confirm it's a server tool by checking the ID prefix.
+       * Anthropic needs both server_tool_use and web_search_tool_result blocks for citations to work.
+       */
+      if (
+        'id' in contentPart &&
+        'name' in contentPart &&
+        'input' in contentPart &&
+        contentPart.type === 'text'
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const id = rawPart.id as string;
+
+        // Only correct if this is definitely a server tool (ID starts with 'srvtoolu_')
+        if (id && id.startsWith('srvtoolu_')) {
+          let input = rawPart.input;
+
+          // Ensure input is an object
+          if (typeof input === 'string') {
+            try {
+              input = JSON.parse(input);
+            } catch {
+              input = {};
+            }
+          }
+
+          const corrected: AnthropicServerToolUseBlockParam = {
+            type: 'server_tool_use',
+            id,
+            name: 'web_search',
+            input: input as Record<string, unknown>,
+          };
+
+          return corrected;
+        }
+
+        // If it's not a server tool, skip it (return null to filter it out)
+        return null;
+      }
+
+      /**
+       * Handle malformed web_search_tool_result blocks marked as text.
+       * These have tool_use_id and nested content - fix their type instead of filtering.
+       * Only correct if we can confirm it's a web search result by checking the tool_use_id prefix.
+       *
+       * Handles both success results (array content) and error results (object with error_code).
+       */
+      if (
+        'tool_use_id' in contentPart &&
+        'content' in contentPart &&
+        contentPart.type === 'text'
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const toolUseId = rawPart.tool_use_id as string;
+        const content = rawPart.content;
+
+        // Only correct if this is definitely a server tool result (tool_use_id starts with 'srvtoolu_')
+        if (toolUseId && toolUseId.startsWith('srvtoolu_')) {
+          // Verify content is either an array (success) or error object
+          const isValidContent =
+            Array.isArray(content) ||
+            (content != null &&
+              typeof content === 'object' &&
+              'type' in content &&
+              (content as Record<string, unknown>).type ===
+                'web_search_tool_result_error');
+
+          if (isValidContent) {
+            const corrected: AnthropicWebSearchToolResultBlockParam = {
+              type: 'web_search_tool_result',
+              tool_use_id: toolUseId,
+              content:
+                content as AnthropicWebSearchToolResultBlockParam['content'],
+            };
+            return corrected;
+          }
+        }
+
+        // If it's not a recognized server tool result format, skip it (return null to filter it out)
+        return null;
+      }
+
       if (isDataContentBlock(contentPart)) {
         return convertToProviderContentBlock(
           contentPart,
@@ -459,6 +543,14 @@ function _formatContent(message: BaseMessage) {
           }
         }
 
+        /**
+         * For multi-turn conversations with citations, we must preserve ALL blocks
+         * including server_tool_use, web_search_tool_result, and web_search_result.
+         * Citations reference search results by index, so filtering changes indices and breaks references.
+         *
+         * The ToolNode already handles skipping server tool invocations via the srvtoolu_ prefix check.
+         */
+
         // TODO: Fix when SDK types are fixed
         return {
           ...contentPartCopy,
@@ -487,10 +579,14 @@ function _formatContent(message: BaseMessage) {
           input: contentPart.functionCall.args,
         };
       } else {
+        console.error(
+          'Unsupported content part:',
+          JSON.stringify(contentPart, null, 2)
+        );
         throw new Error('Unsupported message content format');
       }
     });
-    return contentBlocks;
+    return contentBlocks.filter((block) => block !== null);
   }
 }
 
@@ -545,14 +641,15 @@ export function _convertMessagesToAnthropicPayload(
         }
       } else {
         const { content } = message;
-        const hasMismatchedToolCalls = !message.tool_calls.every((toolCall) =>
-          content.find(
-            (contentPart) =>
-              (contentPart.type === 'tool_use' ||
-                contentPart.type === 'input_json_delta' ||
-                contentPart.type === 'server_tool_use') &&
-              contentPart.id === toolCall.id
-          )
+        const hasMismatchedToolCalls = !message.tool_calls.every(
+          (toolCall) =>
+            !!content.find(
+              (contentPart) =>
+                (contentPart.type === 'tool_use' ||
+                  contentPart.type === 'input_json_delta' ||
+                  contentPart.type === 'server_tool_use') &&
+                contentPart.id === toolCall.id
+            )
         );
         if (hasMismatchedToolCalls) {
           console.warn(

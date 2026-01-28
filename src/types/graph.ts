@@ -18,7 +18,7 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
+import type { ToolMap, ToolEndEvent, GenericTool, LCTool } from '@/types/tools';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -357,6 +357,8 @@ export type MultiAgentGraphInput = StandardGraphInput & {
 
 export interface AgentInputs {
   agentId: string;
+  /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
+  name?: string;
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
@@ -369,4 +371,16 @@ export interface AgentInputs {
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
+  /**
+   * Tool definitions for all tools, including deferred and programmatic.
+   * Used for tool search and programmatic tool calling.
+   * Maps tool name to LCTool definition.
+   */
+  toolRegistry?: Map<string, LCTool>;
+  /**
+   * Serializable tool definitions for event-driven execution.
+   * When provided, ToolNode operates in event-driven mode, dispatching
+   * ON_TOOL_EXECUTE events instead of invoking tools directly.
+   */
+  toolDefinitions?: LCTool[];
 }

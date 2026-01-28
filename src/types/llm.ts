@@ -1,7 +1,5 @@
 // src/types/llm.ts
-import { ChatOllama } from '@langchain/ollama';
 import { ChatMistralAI } from '@langchain/mistralai';
-import { ChatBedrockConverse } from '@langchain/aws';
 import type {
   BindToolsInput,
   BaseChatModelParams,
@@ -23,7 +21,6 @@ import type { RequestOptions } from '@google/generative-ai';
 import type { StructuredTool } from '@langchain/core/tools';
 import type { AnthropicInput } from '@langchain/anthropic';
 import type { Runnable } from '@langchain/core/runnables';
-import type { ChatOllamaInput } from '@langchain/ollama';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import {
@@ -33,6 +30,7 @@ import {
   ChatXAI,
 } from '@/llm/openai';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
+import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
@@ -57,8 +55,9 @@ export type AnthropicReasoning = {
   thinkingBudget?: number;
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
-export type OllamaClientOptions = ChatOllamaInput;
-export type AnthropicClientOptions = AnthropicInput;
+export type AnthropicClientOptions = AnthropicInput & {
+  promptCache?: boolean;
+};
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
   includeThoughts?: boolean;
@@ -80,7 +79,6 @@ export type XAIClientOptions = ChatXAIInput;
 export type ClientOptions =
   | OpenAIClientOptions
   | AzureClientOptions
-  | OllamaClientOptions
   | AnthropicClientOptions
   | MistralAIClientOptions
   | VertexAIClientOptions
@@ -103,7 +101,6 @@ export type LLMConfig = SharedLLMConfig &
 export type ProviderOptionsMap = {
   [Providers.AZURE]: AzureClientOptions;
   [Providers.OPENAI]: OpenAIClientOptions;
-  [Providers.OLLAMA]: OllamaClientOptions;
   [Providers.GOOGLE]: GoogleClientOptions;
   [Providers.VERTEXAI]: VertexAIClientOptions;
   [Providers.DEEPSEEK]: DeepSeekClientOptions;
@@ -118,7 +115,6 @@ export type ProviderOptionsMap = {
 export type ChatModelMap = {
   [Providers.XAI]: ChatXAI;
   [Providers.OPENAI]: ChatOpenAI;
-  [Providers.OLLAMA]: ChatOllama;
   [Providers.AZURE]: AzureChatOpenAI;
   [Providers.DEEPSEEK]: ChatDeepSeek;
   [Providers.VERTEXAI]: ChatVertexAI;
@@ -126,7 +122,7 @@ export type ChatModelMap = {
   [Providers.MISTRALAI]: ChatMistralAI;
   [Providers.MISTRAL]: ChatMistralAI;
   [Providers.OPENROUTER]: ChatOpenRouter;
-  [Providers.BEDROCK]: ChatBedrockConverse;
+  [Providers.BEDROCK]: CustomChatBedrockConverse;
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI;
 };
 

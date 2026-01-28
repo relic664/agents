@@ -65,6 +65,18 @@ export type RunStep = {
   // last_error: string | null;
   id: string; // #new
   runId?: string; // #new
+  agentId?: string; // #new - tracks which agent this step belongs to
+  /**
+   * Group ID - incrementing number (1, 2, 3...) reflecting execution order.
+   * Agents with the same groupId run in parallel and should be rendered together.
+   * undefined means the agent runs sequentially (not part of any parallel group).
+   *
+   * Example for: researcher -> [analyst1, analyst2, analyst3] -> summarizer
+   * - researcher: undefined (sequential)
+   * - analyst1, analyst2, analyst3: 1 (first parallel group)
+   * - summarizer: undefined (sequential)
+   */
+  groupId?: number; // #new
   index: number; // #new
   stepIndex?: number; // #new
   stepDetails: StepDetails;
@@ -115,7 +127,7 @@ export type ToolErrorData = {
 export type ToolEndCallback = (
   data: ToolEndData,
   metadata?: Record<string, unknown>
-) => void;
+) => Promise<void>;
 
 export type ProcessedToolCall = {
   name: string;
@@ -281,7 +293,7 @@ export type ToolCallPart = {
   /** Type ("tool_call") according to Assistants Tool Call Structure */
   type: ContentTypes.TOOL_CALL;
   /** The name of the tool to be called */
-  name: string;
+  name?: string;
   /** The arguments to the tool call */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   args?: string | Record<string, any>;
@@ -331,6 +343,10 @@ export type MessageContentComplex = (
     })
 ) & {
   tool_call_ids?: string[];
+  // Optional agentId for parallel execution attribution
+  agentId?: string;
+  // Optional groupId for parallel group attribution
+  groupId?: number;
 };
 
 export interface TMessage {

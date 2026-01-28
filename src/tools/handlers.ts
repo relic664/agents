@@ -9,7 +9,6 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import {
   ToolCallTypes,
-  ContentTypes,
   GraphEvents,
   StepTypes,
   Providers,
@@ -26,10 +25,12 @@ export async function handleToolCallChunks({
   graph,
   stepKey,
   toolCallChunks,
+  metadata,
 }: {
   graph: StandardGraph | MultiAgentGraph;
   stepKey: string;
   toolCallChunks: ToolCallChunk[];
+  metadata?: Record<string, unknown>;
 }): Promise<void> {
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
@@ -39,12 +40,16 @@ export async function handleToolCallChunks({
   } catch {
     /** Edge Case: If no previous step exists, create a new message creation step */
     const message_id = getMessageId(stepKey, graph, true) ?? '';
-    prevStepId = await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.MESSAGE_CREATION,
-      message_creation: {
-        message_id,
+    prevStepId = await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: {
+          message_id,
+        },
       },
-    });
+      metadata
+    );
     prevRunStep = graph.getRunStep(prevStepId);
   }
 
@@ -81,21 +86,36 @@ export async function handleToolCallChunks({
   const alreadyDispatched =
     prevRunStep?.type === StepTypes.MESSAGE_CREATION &&
     graph.messageStepHasToolCalls.has(prevStepId);
-  if (!alreadyDispatched && tool_calls?.length === toolCallChunks.length) {
-    await graph.dispatchMessageDelta(prevStepId, {
-      content: [
-        {
-          type: ContentTypes.TEXT,
-          text: '',
-          tool_call_ids: tool_calls.map((tc) => tc.id ?? ''),
-        },
-      ],
-    });
+
+  if (prevRunStep?.type === StepTypes.TOOL_CALLS) {
+    /**
+     * If previous step is already a tool_calls step, use that step ID
+     * This ensures tool call deltas are dispatched to the correct step
+     */
+    stepId = prevStepId;
+  } else if (
+    !alreadyDispatched &&
+    prevRunStep?.type === StepTypes.MESSAGE_CREATION
+  ) {
+    /**
+     * Create tool_calls step as soon as we receive the first tool call chunk
+     * This ensures deltas are always associated with the correct step
+     *
+     * NOTE: We do NOT dispatch an empty text block here because:
+     * - Empty text blocks cause providers (Anthropic, Bedrock) to reject messages
+     * - The tool_calls themselves are sufficient for the step
+     * - Empty content with tool_call_ids gets stored in conversation history
+     *   and causes "messages must have non-empty content" errors on replay
+     */
     graph.messageStepHasToolCalls.set(prevStepId, true);
-    stepId = await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.TOOL_CALLS,
-      tool_calls,
-    });
+    stepId = await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: tool_calls ?? [],
+      },
+      metadata
+    );
   }
   await graph.dispatchRunStepDelta(stepId, {
     type: StepTypes.TOOL_CALLS,
@@ -139,26 +159,21 @@ export const handleToolCalls = async (
       // no previous step
     }
 
-    const dispatchToolCallIds = async (
-      lastMessageStepId: string
-    ): Promise<void> => {
-      await graph.dispatchMessageDelta(lastMessageStepId, {
-        content: [
-          {
-            type: 'text',
-            text: '',
-            tool_call_ids: [toolCallId],
-          },
-        ],
-      });
-    };
+    /**
+     * NOTE: We do NOT dispatch empty text blocks with tool_call_ids because:
+     * - Empty text blocks cause providers (Anthropic, Bedrock) to reject messages
+     * - They get stored in conversation history and cause errors on replay:
+     *   "messages must have non-empty content" (Anthropic)
+     *   "The content field in the Message object is empty" (Bedrock)
+     * - The tool_calls themselves are sufficient
+     */
+
     /* If the previous step exists and is a message creation */
     if (
       prevStepId &&
       prevRunStep &&
       prevRunStep.type === StepTypes.MESSAGE_CREATION
     ) {
-      await dispatchToolCallIds(prevStepId);
       graph.messageStepHasToolCalls.set(prevStepId, true);
       /* If the previous step doesn't exist or is not a message creation */
     } else if (
@@ -166,20 +181,27 @@ export const handleToolCalls = async (
       prevRunStep.type !== StepTypes.MESSAGE_CREATION
     ) {
       const messageId = getMessageId(stepKey, graph, true) ?? '';
-      const stepId = await graph.dispatchRunStep(stepKey, {
-        type: StepTypes.MESSAGE_CREATION,
-        message_creation: {
-          message_id: messageId,
+      const stepId = await graph.dispatchRunStep(
+        stepKey,
+        {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: messageId,
+          },
         },
-      });
-      await dispatchToolCallIds(stepId);
-      graph.messageStepHasToolCalls.set(prevStepId, true);
+        metadata
+      );
+      graph.messageStepHasToolCalls.set(stepId, true);
     }
 
-    await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.TOOL_CALLS,
-      tool_calls: [tool_call],
-    });
+    await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: [tool_call],
+      },
+      metadata
+    );
   }
 };
 

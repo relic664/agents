@@ -12,6 +12,7 @@ import {
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
 } from '@google/generative-ai';
 import {
+  AIMessage,
   AIMessageChunk,
   BaseMessage,
   ChatMessage,
@@ -29,7 +30,7 @@ import {
   isDataContentBlock,
 } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import type { ChatGeneration } from '@langchain/core/outputs';
+import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import { isLangChainTool } from '@langchain/core/utils/function_calling';
 import { isOpenAITool } from '@langchain/core/language_models/base';
 import { ToolCallChunk } from '@langchain/core/messages/tool';
@@ -39,6 +40,20 @@ import {
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
 import { GoogleGenerativeAIToolType } from '../types';
+
+export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
+  '__gemini_function_call_thought_signatures__';
+
+const DUMMY_SIGNATURE =
+  'ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==';
+
+/**
+ * Executes a function immediately and returns its result.
+ * Functional utility similar to an Immediately Invoked Function Expression (IIFE).
+ * @param fn The function to execute.
+ * @returns The result of invoking fn.
+ */
+export const iife = <T>(fn: () => T): T => fn();
 
 export function getMessageAuthor(message: BaseMessage): string {
   const type = message._getType();
@@ -301,20 +316,6 @@ function _convertLangChainContentToPart(
         mimeType,
       },
     };
-  } else if (
-    content.type === 'document' ||
-    content.type === 'audio' ||
-    content.type === 'video'
-  ) {
-    if (!isMultimodalModel) {
-      throw new Error(`This model does not support ${content.type}s`);
-    }
-    return {
-      inlineData: {
-        data: content.data,
-        mimeType: content.mimeType,
-      },
-    };
   } else if (content.type === 'media') {
     return messageContentMedia(content);
   } else if (content.type === 'tool_use') {
@@ -352,7 +353,8 @@ function _convertLangChainContentToPart(
 export function convertMessageContentToParts(
   message: BaseMessage,
   isMultimodalModel: boolean,
-  previousMessages: BaseMessage[]
+  previousMessages: BaseMessage[],
+  model?: string
 ): Part[] {
   if (isToolMessage(message)) {
     const messageName =
@@ -409,13 +411,33 @@ export function convertMessageContentToParts(
     );
   }
 
-  if (isAIMessage(message) && message.tool_calls?.length != null) {
-    functionCalls = message.tool_calls.map((tc) => {
+  const functionThoughtSignatures = (
+    message.additional_kwargs as BaseMessage['additional_kwargs'] | undefined
+  )?.[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as
+    | Record<string, string>
+    | undefined;
+
+  if (isAIMessage(message) && (message.tool_calls?.length ?? 0) > 0) {
+    functionCalls = (message.tool_calls ?? []).map((tc) => {
+      const thoughtSignature = iife(() => {
+        if (tc.id != null && tc.id !== '') {
+          const signature = functionThoughtSignatures?.[tc.id];
+          if (signature != null && signature !== '') {
+            return signature;
+          }
+        }
+        if (model?.includes('gemini-3') === true) {
+          return DUMMY_SIGNATURE;
+        }
+        return '';
+      });
+
       return {
         functionCall: {
           name: tc.name,
           args: tc.args,
         },
+        ...(thoughtSignature ? { thoughtSignature } : {}),
       };
     });
   }
@@ -426,7 +448,9 @@ export function convertMessageContentToParts(
 export function convertBaseMessagesToContent(
   messages: BaseMessage[],
   isMultimodalModel: boolean,
-  convertSystemMessageToHumanContent: boolean = false
+  convertSystemMessageToHumanContent: boolean = false,
+
+  model?: string
 ): Content[] | undefined {
   return messages.reduce<{
     content: Content[] | undefined;
@@ -456,7 +480,8 @@ export function convertBaseMessagesToContent(
       const parts = convertMessageContentToParts(
         message,
         isMultimodalModel,
-        messages.slice(0, index)
+        messages.slice(0, index),
+        model
       );
 
       if (acc.mergeWithPreviousContent) {
@@ -505,11 +530,32 @@ export function convertResponseContentToChatGenerationChunk(
   if (!response.candidates || response.candidates.length === 0) {
     return null;
   }
-  const functionCalls = response.functionCalls();
   const [candidate] = response.candidates as [
     Partial<GenerateContentCandidate> | undefined,
   ];
   const { content: candidateContent, ...generationInfo } = candidate ?? {};
+
+  // Extract function calls directly from parts to preserve thoughtSignature
+  const functionCalls =
+    (candidateContent?.parts as Part[] | undefined)?.reduce(
+      (acc, p) => {
+        if ('functionCall' in p && p.functionCall) {
+          acc.push({
+            ...p,
+            id:
+              'id' in p.functionCall && typeof p.functionCall.id === 'string'
+                ? p.functionCall.id
+                : uuidv4(),
+          });
+        }
+        return acc;
+      },
+      [] as (
+        | undefined
+        | (FunctionCallPart & { id: string; thoughtSignature?: string })
+      )[]
+    ) ?? [];
+
   let content: MessageContent | undefined;
   // Checks if some parts do not have text. If false, it means that the content is a string.
   const reasoningParts: string[] = [];
@@ -529,27 +575,30 @@ export function convertResponseContentToChatGenerationChunk(
     }
     content = textParts.join('');
   } else if (candidateContent && Array.isArray(candidateContent.parts)) {
-    content = candidateContent.parts.map((p) => {
-      if ('text' in p && 'thought' in p && p.thought === true) {
-        reasoningParts.push(p.text ?? '');
-      } else if ('text' in p) {
-        return {
-          type: 'text',
-          text: p.text,
-        };
-      } else if ('executableCode' in p) {
-        return {
-          type: 'executableCode',
-          executableCode: p.executableCode,
-        };
-      } else if ('codeExecutionResult' in p) {
-        return {
-          type: 'codeExecutionResult',
-          codeExecutionResult: p.codeExecutionResult,
-        };
-      }
-      return p;
-    });
+    content = candidateContent.parts
+      .map((p) => {
+        if ('text' in p && 'thought' in p && p.thought === true) {
+          reasoningParts.push(p.text ?? '');
+          return undefined;
+        } else if ('text' in p) {
+          return {
+            type: 'text',
+            text: p.text,
+          };
+        } else if ('executableCode' in p) {
+          return {
+            type: 'executableCode',
+            executableCode: p.executableCode,
+          };
+        } else if ('codeExecutionResult' in p) {
+          return {
+            type: 'codeExecutionResult',
+            codeExecutionResult: p.codeExecutionResult,
+          };
+        }
+        return p;
+      })
+      .filter((p) => p !== undefined);
   } else {
     // no content returned - likely due to abnormal stop reason, e.g. malformed function call
     content = [];
@@ -566,20 +615,36 @@ export function convertResponseContentToChatGenerationChunk(
   }
 
   const toolCallChunks: ToolCallChunk[] = [];
-  if (functionCalls) {
+  if (functionCalls.length > 0) {
     toolCallChunks.push(
       ...functionCalls.map((fc) => ({
-        ...fc,
-        args: JSON.stringify(fc.args),
-        // Un-commenting this causes LangChain to incorrectly merge tool calls together
-        // index: extra.index,
         type: 'tool_call_chunk' as const,
-        id: 'id' in fc && typeof fc.id === 'string' ? fc.id : uuidv4(),
+        id: fc?.id,
+        name: fc?.functionCall.name,
+        args: JSON.stringify(fc?.functionCall.args),
       }))
     );
   }
 
-  const additional_kwargs: ChatGeneration['message']['additional_kwargs'] = {};
+  // Extract thought signatures from function calls for Gemini 3+
+  const functionThoughtSignatures = functionCalls.reduce(
+    (acc, fc) => {
+      if (
+        fc &&
+        'thoughtSignature' in fc &&
+        typeof fc.thoughtSignature === 'string'
+      ) {
+        acc[fc.id] = fc.thoughtSignature;
+      }
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+
+  const additional_kwargs: ChatGeneration['message']['additional_kwargs'] = {
+    [_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY]: functionThoughtSignatures,
+  };
+
   if (reasoningParts.length > 0) {
     additional_kwargs.reasoning = reasoningParts.join('');
   }
@@ -606,6 +671,154 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
+}
+
+/**
+ * Maps a Google GenerateContentResult to a LangChain ChatResult
+ */
+export function mapGenerateContentResultToChatResult(
+  response: EnhancedGenerateContentResponse,
+  extra?: {
+    usageMetadata: UsageMetadata | undefined;
+  }
+): ChatResult {
+  if (
+    !response.candidates ||
+    response.candidates.length === 0 ||
+    !response.candidates[0]
+  ) {
+    return {
+      generations: [],
+      llmOutput: {
+        filters: response.promptFeedback,
+      },
+    };
+  }
+  const [candidate] = response.candidates as [
+    Partial<GenerateContentCandidate> | undefined,
+  ];
+  const { content: candidateContent, ...generationInfo } = candidate ?? {};
+
+  // Extract function calls directly from parts to preserve thoughtSignature
+  const functionCalls =
+    candidateContent?.parts.reduce(
+      (acc, p) => {
+        if ('functionCall' in p && p.functionCall) {
+          acc.push({
+            ...p,
+            id:
+              'id' in p.functionCall && typeof p.functionCall.id === 'string'
+                ? p.functionCall.id
+                : uuidv4(),
+          });
+        }
+        return acc;
+      },
+      [] as (FunctionCallPart & { id: string; thoughtSignature?: string })[]
+    ) ?? [];
+
+  let content: MessageContent | undefined;
+  const reasoningParts: string[] = [];
+  if (
+    Array.isArray(candidateContent?.parts) &&
+    candidateContent.parts.length === 1 &&
+    candidateContent.parts[0].text &&
+    !(
+      'thought' in candidateContent.parts[0] &&
+      candidateContent.parts[0].thought === true
+    )
+  ) {
+    content = candidateContent.parts[0].text;
+  } else if (
+    Array.isArray(candidateContent?.parts) &&
+    candidateContent.parts.length > 0
+  ) {
+    content = candidateContent.parts
+      .map((p) => {
+        if ('text' in p && 'thought' in p && p.thought === true) {
+          reasoningParts.push(p.text ?? '');
+          return undefined;
+        } else if ('text' in p) {
+          return {
+            type: 'text',
+            text: p.text,
+          };
+        } else if ('executableCode' in p) {
+          return {
+            type: 'executableCode',
+            executableCode: p.executableCode,
+          };
+        } else if ('codeExecutionResult' in p) {
+          return {
+            type: 'codeExecutionResult',
+            codeExecutionResult: p.codeExecutionResult,
+          };
+        }
+        return p;
+      })
+      .filter((p) => p !== undefined);
+  } else {
+    content = [];
+  }
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content) && content.length > 0) {
+    const block = content.find((b) => 'text' in b) as
+      | { text: string }
+      | undefined;
+    text = block?.text ?? text;
+  }
+
+  const additional_kwargs: ChatGeneration['message']['additional_kwargs'] = {
+    ...generationInfo,
+  };
+  if (reasoningParts.length > 0) {
+    additional_kwargs.reasoning = reasoningParts.join('');
+  }
+
+  // Extract thought signatures from function calls for Gemini 3+
+  const functionThoughtSignatures = functionCalls.reduce(
+    (acc, fc) => {
+      if ('thoughtSignature' in fc && typeof fc.thoughtSignature === 'string') {
+        acc[fc.id] = fc.thoughtSignature;
+      }
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+
+  const tool_calls = functionCalls.map((fc) => ({
+    type: 'tool_call' as const,
+    id: fc.id,
+    name: fc.functionCall.name,
+    args: fc.functionCall.args,
+  }));
+
+  // Store thought signatures map for later retrieval
+  additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] =
+    functionThoughtSignatures;
+
+  const generation: ChatGeneration = {
+    text,
+    message: new AIMessage({
+      content: content ?? '',
+      tool_calls,
+      additional_kwargs,
+      usage_metadata: extra?.usageMetadata,
+    }),
+    generationInfo,
+  };
+  return {
+    generations: [generation],
+    llmOutput: {
+      tokenUsage: {
+        promptTokens: extra?.usageMetadata?.input_tokens,
+        completionTokens: extra?.usageMetadata?.output_tokens,
+        totalTokens: extra?.usageMetadata?.total_tokens,
+      },
+    },
+  };
 }
 
 export function convertToGenerativeAITools(

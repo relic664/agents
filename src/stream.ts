@@ -107,6 +107,28 @@ export function getChunkContent({
         | undefined
     )?.summary?.[0]?.text;
   }
+  /**
+   * For OpenRouter, reasoning is stored in additional_kwargs.reasoning (not reasoning_content).
+   * NOTE: We intentionally do NOT extract text from reasoning_details here.
+   * The reasoning_details array contains the FULL accumulated reasoning text (set only on final chunk),
+   * but individual reasoning tokens are already streamed via additional_kwargs.reasoning.
+   * Extracting from reasoning_details would cause duplication.
+   * The reasoning_details is only used for:
+   * 1. Detecting reasoning mode in handleReasoning()
+   * 2. Final message storage (for thought signatures)
+   */
+  if (provider === Providers.OPENROUTER) {
+    // Content presence signals end of reasoning phase - prefer content over reasoning
+    // This handles transitional chunks that may have both reasoning and content
+    if (typeof chunk?.content === 'string' && chunk.content !== '') {
+      return chunk.content;
+    }
+    const reasoning = chunk?.additional_kwargs?.reasoning as string | undefined;
+    if (reasoning != null && reasoning !== '') {
+      return reasoning;
+    }
+    return chunk?.content;
+  }
   return (
     ((chunk?.additional_kwargs?.[reasoningKey] as string | undefined) ?? '') ||
     chunk?.content
@@ -155,7 +177,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_calls.length > 0 &&
       chunk.tool_calls.every(
         (tc) =>
-          tc.id != null && tc.id !== '' && tc.name != null && tc.name !== ''
+          tc.id != null &&
+          tc.id !== '' &&
+          (tc as Partial<ToolCall>).name != null &&
+          tc.name !== ''
       )
     ) {
       hasToolCalls = true;
@@ -194,6 +219,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
+        metadata,
       });
     }
 
@@ -203,12 +229,16 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
-      await graph.dispatchRunStep(stepKey, {
-        type: StepTypes.MESSAGE_CREATION,
-        message_creation: {
-          message_id,
+      await graph.dispatchRunStep(
+        stepKey,
+        {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id,
+          },
         },
-      });
+        metadata
+      );
     }
 
     const stepId = graph.getStepIdByKey(stepKey);
@@ -267,12 +297,16 @@ hasToolCallChunks: ${hasToolCallChunks}
           agentContext.tokenTypeSwitch = 'content';
           const newStepKey = graph.getStepKey(metadata);
           const message_id = getMessageId(newStepKey, graph) ?? '';
-          await graph.dispatchRunStep(newStepKey, {
-            type: StepTypes.MESSAGE_CREATION,
-            message_creation: {
-              message_id,
+          await graph.dispatchRunStep(
+            newStepKey,
+            {
+              type: StepTypes.MESSAGE_CREATION,
+              message_creation: {
+                message_id,
+              },
             },
-          });
+            metadata
+          );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
           await graph.dispatchMessageDelta(newStepId, {
@@ -305,7 +339,8 @@ hasToolCallChunks: ${hasToolCallChunks}
         (c) =>
           (c.type?.startsWith(ContentTypes.THINKING) ?? false) ||
           (c.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-          (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false)
+          (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+          c.type === 'redacted_thinking'
       )
     ) {
       await graph.dispatchReasoningDelta(stepId, {
@@ -331,7 +366,8 @@ hasToolCallChunks: ${hasToolCallChunks}
       Array.isArray(chunk.content) &&
       (chunk.content[0]?.type === ContentTypes.THINKING ||
         chunk.content[0]?.type === ContentTypes.REASONING ||
-        chunk.content[0]?.type === ContentTypes.REASONING_CONTENT)
+        chunk.content[0]?.type === ContentTypes.REASONING_CONTENT ||
+        chunk.content[0]?.type === 'redacted_thinking')
     ) {
       reasoning_content = 'valid';
     } else if (
@@ -341,6 +377,18 @@ hasToolCallChunks: ${hasToolCallChunks}
       typeof reasoning_content !== 'string' &&
       reasoning_content.summary?.[0]?.text != null &&
       reasoning_content.summary[0].text
+    ) {
+      reasoning_content = 'valid';
+    } else if (
+      agentContext.provider === Providers.OPENROUTER &&
+      // Only set reasoning as valid if content is NOT present (content signals end of reasoning)
+      (chunk.content == null || chunk.content === '') &&
+      // Check for reasoning_details (final chunk) OR reasoning string (intermediate chunks)
+      ((chunk.additional_kwargs?.reasoning_details != null &&
+        Array.isArray(chunk.additional_kwargs.reasoning_details) &&
+        chunk.additional_kwargs.reasoning_details.length > 0) ||
+        (typeof chunk.additional_kwargs?.reasoning === 'string' &&
+          chunk.additional_kwargs.reasoning !== ''))
     ) {
       reasoning_content = 'valid';
     }
@@ -396,6 +444,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
   const toolCallIdMap = new Map<string, string>();
+  // Track agentId and groupId for each content index (applied to content parts)
+  const contentMetaMap = new Map<
+    number,
+    { agentId?: string; groupId?: number }
+  >();
 
   const updateContent = (
     index: number,
@@ -474,13 +527,26 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       partType === ContentTypes.TOOL_CALL &&
       'tool_call' in contentPart
     ) {
+      const incomingName = contentPart.tool_call.name;
+      const incomingId = contentPart.tool_call.id;
+      const toolCallArgs = (contentPart.tool_call as t.ToolCallPart).args;
+
+      // When we receive a tool call with a name, it's the complete tool call
+      // Consolidate with any previously accumulated args from chunks
+      const hasValidName = incomingName != null && incomingName !== '';
+
+      // Only process if incoming has a valid name (complete tool call)
+      // or if we're doing a final update with complete data
+      if (!hasValidName && !finalUpdate) {
+        return;
+      }
+
       const existingContent = contentParts[index] as
         | (Omit<t.ToolCallContent, 'tool_call'> & {
             tool_call?: t.ToolCallPart;
           })
         | undefined;
 
-      const toolCallArgs = (contentPart.tool_call as t.ToolCallPart).args;
       /** When args are a valid object, they are likely already invoked */
       let args =
         finalUpdate ||
@@ -497,15 +563,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       }
 
       const id =
-        getNonEmptyValue([
-          contentPart.tool_call.id,
-          existingContent?.tool_call?.id,
-        ]) ?? '';
+        getNonEmptyValue([incomingId, existingContent?.tool_call?.id]) ?? '';
       const name =
-        getNonEmptyValue([
-          contentPart.tool_call.name,
-          existingContent?.tool_call?.name,
-        ]) ?? '';
+        getNonEmptyValue([incomingName, existingContent?.tool_call?.name]) ??
+        '';
 
       const newToolCall: ToolCall & t.PartMetadata = {
         id,
@@ -524,6 +585,17 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         tool_call: newToolCall,
       };
     }
+
+    // Apply agentId (for MultiAgentGraph) and groupId (for parallel execution) to content parts
+    // - agentId present → MultiAgentGraph (show agent labels)
+    // - groupId present → parallel execution (render columns)
+    const meta = contentMetaMap.get(index);
+    if (meta?.agentId != null) {
+      (contentParts[index] as t.MessageContentComplex).agentId = meta.agentId;
+    }
+    if (meta?.groupId != null) {
+      (contentParts[index] as t.MessageContentComplex).groupId = meta.groupId;
+    }
   };
 
   const aggregateContent = ({
@@ -541,6 +613,22 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     if (event === GraphEvents.ON_RUN_STEP) {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
+
+      // Track agentId (MultiAgentGraph) and groupId (parallel execution) separately
+      // - agentId: present for all MultiAgentGraph runs (enables agent labels in UI)
+      // - groupId: present only for parallel execution (enables column rendering)
+      const hasAgentId = runStep.agentId != null && runStep.agentId !== '';
+      const hasGroupId = runStep.groupId != null;
+      if (hasAgentId || hasGroupId) {
+        const existingMeta = contentMetaMap.get(runStep.index) ?? {};
+        if (hasAgentId) {
+          existingMeta.agentId = runStep.agentId;
+        }
+        if (hasGroupId) {
+          existingMeta.groupId = runStep.groupId;
+        }
+        contentMetaMap.set(runStep.index, existingMeta);
+      }
 
       // Store tool call IDs if present
       if (

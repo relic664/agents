@@ -18,18 +18,43 @@ async function testStandardStreaming(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
   const { contentParts, aggregateContent } = createContentAggregator();
   const customHandlers = {
-    [GraphEvents.TOOL_END]: new ToolEndHandler(undefined, (name?: string) => {
-      return true;
-    }),
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+    [GraphEvents.TOOL_END]: new ToolEndHandler(
+      undefined,
+      undefined,
+      (name?: string) => {
+        return true;
+      }
+    ),
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: (
+        _event: string,
+        _data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
+        console.log('\n====== CHAT_MODEL_END METADATA ======');
+        console.dir(metadata, { depth: null });
+      },
+    },
+    [GraphEvents.CHAT_MODEL_START]: {
+      handle: (
+        _event: string,
+        _data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
+        console.log('\n====== CHAT_MODEL_START METADATA ======');
+        console.dir(metadata, { depth: null });
+      },
+    },
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
-        console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
         aggregateContent({
           event,
           data: data as unknown as { result: t.ToolEndEvent },
@@ -39,10 +64,14 @@ async function testStandardStreaming(): Promise<void> {
     [GraphEvents.ON_RUN_STEP]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
         console.log('====== ON_RUN_STEP ======');
+        console.log('DATA:');
         console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
         aggregateContent({ event, data: data as t.RunStep });
       },
     },
@@ -51,8 +80,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_RUN_STEP_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_RUN_STEP_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
       },
     },
@@ -61,8 +88,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -71,8 +96,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_REASONING_DELTA,
         data: t.StreamEventData
       ) => {
-        console.log('====== ON_REASONING_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.ReasoningDeltaEvent });
       },
     },
@@ -83,7 +106,8 @@ async function testStandardStreaming(): Promise<void> {
         metadata?: Record<string, unknown>
       ): void => {
         console.log('====== TOOL_START ======');
-        console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
       },
     },
   };
@@ -121,7 +145,7 @@ async function testStandardStreaming(): Promise<void> {
 
   console.log('Test 1: Calculation query');
 
-  const userMessage = `What is 1123123 + 123123 / 20348?`;
+  const userMessage = `What is 1123123 + 123123 / 20348? After that, run some interesting calculations based off the result`;
 
   conversationHistory.push(new HumanMessage(userMessage));
 

@@ -1,4 +1,11 @@
-// src/scripts/cli.ts
+// src/scripts/code_exec_files.ts
+/**
+ * Tests automatic session tracking for code execution file persistence.
+ * Files created in one execution are automatically available in subsequent executions
+ * without the LLM needing to track or pass session_id.
+ *
+ * Run with: npm run code_exec_files
+ */
 import { config } from 'dotenv';
 config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
@@ -12,11 +19,38 @@ import {
 } from '@/events';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
-import { GraphEvents } from '@/common';
+import { Constants, GraphEvents } from '@/common';
 import { Run } from '@/run';
 import { createCodeExecutionTool } from '@/tools/CodeExecutor';
 
 const conversationHistory: BaseMessage[] = [];
+
+/**
+ * Prints session context from the graph for debugging
+ */
+function printSessionContext(run: Run<t.IState>): void {
+  const graph = run.Graph;
+  if (!graph) {
+    console.log('[Session] No graph available');
+    return;
+  }
+
+  const session = graph.sessions.get(Constants.EXECUTE_CODE) as
+    | t.CodeSessionContext
+    | undefined;
+
+  if (!session) {
+    console.log('[Session] No session context stored yet');
+    return;
+  }
+
+  console.log('[Session] Current session context:');
+  console.log(`  - session_id: ${session.session_id}`);
+  console.log(`  - files: ${JSON.stringify(session.files, null, 2)}`);
+  console.log(
+    `  - lastUpdated: ${new Date(session.lastUpdated).toISOString()}`
+  );
+}
 
 async function testCodeExecution(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
@@ -72,7 +106,7 @@ async function testCodeExecution(): Promise<void> {
       handle: (
         _event: string,
         data: t.StreamEventData,
-        metadata?: Record<string, unknown>
+        _metadata?: Record<string, unknown>
       ): void => {
         console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
@@ -96,7 +130,7 @@ async function testCodeExecution(): Promise<void> {
     customHandlers,
   });
 
-  const config: Partial<RunnableConfig> & {
+  const streamConfig: Partial<RunnableConfig> & {
     version: 'v1' | 'v2';
     run_id?: string;
     streamMode: string;
@@ -107,10 +141,12 @@ async function testCodeExecution(): Promise<void> {
     },
     streamMode: 'values',
     version: 'v2' as const,
-    // recursionLimit: 3,
   };
 
-  console.log('Test 1: Create Project Plan');
+  console.log('\n========== Test 1: Create Project Plan ==========\n');
+  console.log(
+    'Creating initial file - this establishes the session context.\n'
+  );
 
   const userMessage1 = `
   Hi ${userName} here. We are testing your file capabilities.
@@ -125,36 +161,43 @@ async function testCodeExecution(): Promise<void> {
   let inputs = {
     messages: conversationHistory,
   };
-  const finalContentParts1 = await run.processStream(inputs, config);
+  await run.processStream(inputs, streamConfig);
   const finalMessages1 = run.getRunMessages();
   if (finalMessages1) {
     conversationHistory.push(...finalMessages1);
   }
-  console.log('\n\n====================\n\n');
+
+  console.log('\n\n========== Session Context After Test 1 ==========\n');
+  printSessionContext(run);
   console.dir(contentParts, { depth: null });
 
-  console.log('Test 2: Edit Project Plan');
+  console.log('\n========== Test 2: Edit Project Plan ==========\n');
+  console.log(
+    'Editing the file from Test 1 - session_id is automatically injected.\n'
+  );
 
   const userMessage2 = `
   Thanks for creating the project plan. Now I'd like you to edit the same plan to:
   
-  1. Add a new section called "Technology Stack" that contains: "The technology stack for this project includes the following technologies" and nothing more.
-  
+  1. Read the existing project_plan.txt file
+  2. Add a new section called "Technology Stack" that contains: "The technology stack for this project includes the following technologies" and nothing more.
+  3. Save this as a new file called "project_plan_v2.txt" (remember files are read-only)
+  4. Print the contents of both files to verify
 `;
-
-  // Make sure to pass the file ID of the previous file you created and explicitly duplicate or rename the file in your code so we can then access it. Also print the contents of the new file to ensure we did what we wanted.`;
 
   conversationHistory.push(new HumanMessage(userMessage2));
 
   inputs = {
     messages: conversationHistory,
   };
-  const finalContentParts2 = await run.processStream(inputs, config);
+  await run.processStream(inputs, streamConfig);
   const finalMessages2 = run.getRunMessages();
   if (finalMessages2) {
     conversationHistory.push(...finalMessages2);
   }
-  console.log('\n\n====================\n\n');
+
+  console.log('\n\n========== Session Context After Test 2 ==========\n');
+  printSessionContext(run);
   console.dir(contentParts, { depth: null });
 
   const { handleLLMEnd, collected } = createMetadataAggregator();

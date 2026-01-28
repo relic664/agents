@@ -56,8 +56,10 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     provider: Providers.OPENROUTER,
     streaming: true,
     streamUsage: true,
-    model: 'openai/gpt-4.1',
-    openAIApiKey: process.env.OPENROUTER_API_KEY,
+    // model: 'anthropic/claude-sonnet-4',
+    // model: 'moonshotai/kimi-k2-thinking',
+    model: 'google/gemini-3-pro-preview',
+    apiKey: process.env.OPENROUTER_API_KEY,
     configuration: {
       baseURL: process.env.OPENROUTER_BASE_URL,
       defaultHeaders: {
@@ -66,6 +68,12 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
       },
     },
     include_reasoning: true,
+    modelKwargs: {
+      reasoning: {
+        max_tokens: 8000,
+      },
+      max_tokens: 10000,
+    },
   } as or.ChatOpenRouterCallOptions & t.LLMConfig,
   [Providers.AZURE]: {
     provider: Providers.AZURE,
@@ -78,12 +86,14 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
     model: process.env.AZURE_MODEL_NAME ?? 'gpt-4o',
   },
-  [Providers.OLLAMA]: {
-    provider: Providers.OLLAMA,
+  ollama: {
+    provider: Providers.OPENAI,
     model: 'gpt-oss:20b',
     streaming: true,
     streamUsage: true,
-    baseUrl: 'http://localhost:11434',
+    configuration: {
+      baseURL: 'http://localhost:11434/v1',
+    },
   },
   lmstudio: {
     provider: Providers.OPENAI,
@@ -137,9 +147,14 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
   [Providers.VERTEXAI]: {
     provider: Providers.VERTEXAI,
     model: 'gemini-2.5-flash',
+    // model: 'gemini-2.5-pro',
     streaming: true,
     streamUsage: true,
     keyFile: process.env.VERTEXAI_KEY_FILE,
+    // maxRetries: 2,
+    // location: 'global',
+    // thinkingBudget: -1,
+    // includeThoughts: true,
   } as t.VertexAIClientOptions & t.LLMConfig,
   [Providers.GOOGLE]: {
     provider: Providers.GOOGLE,

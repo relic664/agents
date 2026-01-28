@@ -1,7 +1,11 @@
 {
   "name": "@librechat/agents-types",
-  "version": "3.0.13",
+  "version": "3.1.26",
   "description": "Type definitions for @librechat/agents",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danny-avila/agents"
+  },
   "types": "index.d.ts",
   "scripts": {
     "build": "tsc"

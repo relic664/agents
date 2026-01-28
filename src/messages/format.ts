@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import {
   AIMessage,
+  AIMessageChunk,
   ToolMessage,
   BaseMessage,
   HumanMessage,
@@ -10,7 +11,10 @@ import {
 import type { MessageContentImageUrl } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  ExtendedMessageContent,
   MessageContentComplex,
+  ReasoningContentText,
+  ToolCallContent,
   ToolCallPart,
   TPayload,
   TMessage,
@@ -306,14 +310,13 @@ function formatAssistantMessage(
         }
         // Create a new AIMessage with this text and prepare for tool calls
         lastAIMessage = new AIMessage({
-          content: part.text || '',
+          content: part.text != null ? part.text : '',
         });
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
-        if (!lastAIMessage) {
-          // "Heal" the payload by creating an AIMessage to precede the tool call
-          lastAIMessage = new AIMessage({ content: '' });
-          formattedMessages.push(lastAIMessage);
+        // Skip malformed tool call entries without tool_call property
+        if (part.tool_call == null) {
+          continue;
         }
 
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
@@ -322,6 +325,21 @@ function formatAssistantMessage(
           args: _args,
           ..._tool_call
         } = part.tool_call as ToolCallPart;
+
+        // Skip invalid tool calls that have no name AND no output
+        if (
+          _tool_call.name == null ||
+          (_tool_call.name === '' && (output == null || output === ''))
+        ) {
+          continue;
+        }
+
+        if (!lastAIMessage) {
+          // "Heal" the payload by creating an AIMessage to precede the tool call
+          lastAIMessage = new AIMessage({ content: '' });
+          formattedMessages.push(lastAIMessage);
+        }
+
         const tool_call: ToolCallPart = _tool_call;
         // TODO: investigate; args as dictionary may need to be providers-or-tool-specific
         let args: any = _args;
@@ -345,7 +363,7 @@ function formatAssistantMessage(
           new ToolMessage({
             tool_call_id: tool_call.id ?? '',
             name: tool_call.name,
-            content: output || '',
+            content: output != null ? output : '',
           })
         );
       } else if (part.type === ContentTypes.THINK) {
@@ -383,6 +401,226 @@ function formatAssistantMessage(
 }
 
 /**
+ * Labels all agent content for parallel patterns (fan-out/fan-in)
+ * Groups consecutive content by agent and wraps with clear labels
+ */
+function labelAllAgentContent(
+  contentParts: MessageContentComplex[],
+  agentIdMap: Record<number, string>,
+  agentNames?: Record<string, string>
+): MessageContentComplex[] {
+  const result: MessageContentComplex[] = [];
+  let currentAgentId: string | undefined;
+  let agentContentBuffer: MessageContentComplex[] = [];
+
+  const flushAgentBuffer = (): void => {
+    if (agentContentBuffer.length === 0) {
+      return;
+    }
+
+    if (currentAgentId != null && currentAgentId !== '') {
+      const agentName = (agentNames?.[currentAgentId] ?? '') || currentAgentId;
+      const formattedParts: string[] = [];
+
+      formattedParts.push(`--- ${agentName} ---`);
+
+      for (const part of agentContentBuffer) {
+        if (part.type === ContentTypes.THINK) {
+          const thinkContent = (part as ReasoningContentText).think || '';
+          if (thinkContent) {
+            formattedParts.push(
+              `${agentName}: ${JSON.stringify({
+                type: 'think',
+                think: thinkContent,
+              })}`
+            );
+          }
+        } else if (part.type === ContentTypes.TEXT) {
+          const textContent: string = part.text ?? '';
+          if (textContent) {
+            formattedParts.push(`${agentName}: ${textContent}`);
+          }
+        } else if (part.type === ContentTypes.TOOL_CALL) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'tool_call',
+              tool_call: (part as ToolCallContent).tool_call,
+            })}`
+          );
+        }
+      }
+
+      formattedParts.push(`--- End of ${agentName} ---`);
+
+      // Create a single text content part with all agent content
+      result.push({
+        type: ContentTypes.TEXT,
+        text: formattedParts.join('\n\n'),
+      } as MessageContentComplex);
+    } else {
+      // No agent ID, pass through as-is
+      result.push(...agentContentBuffer);
+    }
+
+    agentContentBuffer = [];
+  };
+
+  for (let i = 0; i < contentParts.length; i++) {
+    const part = contentParts[i];
+    const agentId = agentIdMap[i];
+
+    // If agent changed, flush previous buffer
+    if (agentId !== currentAgentId && currentAgentId !== undefined) {
+      flushAgentBuffer();
+    }
+
+    currentAgentId = agentId;
+    agentContentBuffer.push(part);
+  }
+
+  // Flush any remaining content
+  flushAgentBuffer();
+
+  return result;
+}
+
+/**
+ * Groups content parts by agent and formats them with agent labels
+ * This preprocesses multi-agent content to prevent identity confusion
+ *
+ * @param contentParts - The content parts from a run
+ * @param agentIdMap - Map of content part index to agent ID
+ * @param agentNames - Optional map of agent ID to display name
+ * @param options - Configuration options
+ * @param options.labelNonTransferContent - If true, labels all agent transitions (for parallel patterns)
+ * @returns Modified content parts with agent labels where appropriate
+ */
+export const labelContentByAgent = (
+  contentParts: MessageContentComplex[],
+  agentIdMap?: Record<number, string>,
+  agentNames?: Record<string, string>,
+  options?: { labelNonTransferContent?: boolean }
+): MessageContentComplex[] => {
+  if (!agentIdMap || Object.keys(agentIdMap).length === 0) {
+    return contentParts;
+  }
+
+  // If labelNonTransferContent is true, use a different strategy for parallel patterns
+  if (options?.labelNonTransferContent === true) {
+    return labelAllAgentContent(contentParts, agentIdMap, agentNames);
+  }
+
+  const result: MessageContentComplex[] = [];
+  let currentAgentId: string | undefined;
+  let agentContentBuffer: MessageContentComplex[] = [];
+  let transferToolCallIndex: number | undefined;
+  let transferToolCallId: string | undefined;
+
+  const flushAgentBuffer = (): void => {
+    if (agentContentBuffer.length === 0) {
+      return;
+    }
+
+    // If this is content from a transferred agent, format it specially
+    if (
+      currentAgentId != null &&
+      currentAgentId !== '' &&
+      transferToolCallIndex !== undefined
+    ) {
+      const agentName = (agentNames?.[currentAgentId] ?? '') || currentAgentId;
+      const formattedParts: string[] = [];
+
+      formattedParts.push(`--- Transfer to ${agentName} ---`);
+
+      for (const part of agentContentBuffer) {
+        if (part.type === ContentTypes.THINK) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'think',
+              think: (part as ReasoningContentText).think,
+            })}`
+          );
+        } else if ('text' in part && part.type === ContentTypes.TEXT) {
+          const textContent: string = part.text ?? '';
+          if (textContent) {
+            formattedParts.push(
+              `${agentName}: ${JSON.stringify({
+                type: 'text',
+                text: textContent,
+              })}`
+            );
+          }
+        } else if (part.type === ContentTypes.TOOL_CALL) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'tool_call',
+              tool_call: (part as ToolCallContent).tool_call,
+            })}`
+          );
+        }
+      }
+
+      formattedParts.push(`--- End of ${agentName} response ---`);
+
+      // Find the tool call that triggered this transfer and update its output
+      if (transferToolCallIndex < result.length) {
+        const transferToolCall = result[transferToolCallIndex];
+        if (
+          transferToolCall.type === ContentTypes.TOOL_CALL &&
+          transferToolCall.tool_call?.id === transferToolCallId
+        ) {
+          transferToolCall.tool_call.output = formattedParts.join('\n\n');
+        }
+      }
+    } else {
+      // Not from a transfer, add as-is
+      result.push(...agentContentBuffer);
+    }
+
+    agentContentBuffer = [];
+    transferToolCallIndex = undefined;
+    transferToolCallId = undefined;
+  };
+
+  for (let i = 0; i < contentParts.length; i++) {
+    const part = contentParts[i];
+    const agentId = agentIdMap[i];
+
+    // Check if this is a transfer tool call
+    const isTransferTool =
+      (part.type === ContentTypes.TOOL_CALL &&
+        (part as ToolCallContent).tool_call?.name?.startsWith(
+          'lc_transfer_to_'
+        )) ??
+      false;
+
+    // If agent changed, flush previous buffer
+    if (agentId !== currentAgentId && currentAgentId !== undefined) {
+      flushAgentBuffer();
+    }
+
+    currentAgentId = agentId;
+
+    if (isTransferTool) {
+      // Flush any existing buffer first
+      flushAgentBuffer();
+      // Add the transfer tool call to result
+      result.push(part);
+      // Mark that the next agent's content should be captured
+      transferToolCallIndex = result.length - 1;
+      transferToolCallId = (part as ToolCallContent).tool_call?.id;
+      currentAgentId = undefined; // Reset to capture the next agent
+    } else {
+      agentContentBuffer.push(part);
+    }
+  }
+
+  flushAgentBuffer();
+
+  return result;
+};
+
+/**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
  * @param payload - The array of messages to format.
@@ -392,7 +630,7 @@ function formatAssistantMessage(
  */
 export const formatAgentMessages = (
   payload: TPayload,
-  indexTokenCountMap?: Record<number, number>,
+  indexTokenCountMap?: Record<number, number | undefined>,
   tools?: Set<string>
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
@@ -404,7 +642,7 @@ export const formatAgentMessages = (
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
   // Keep track of the mapping from original payload indices to result indices
-  const indexMapping: Record<number, number[]> = {};
+  const indexMapping: Record<number, number[] | undefined> = {};
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
@@ -448,6 +686,15 @@ export const formatAgentMessages = (
               hasInvalidTool = true;
               break;
             }
+            // Protect against malformed tool call entries
+            if (
+              part.tool_call == null ||
+              part.tool_call.name == null ||
+              part.tool_call.name === ''
+            ) {
+              hasInvalidTool = true;
+              continue;
+            }
             const toolName = part.tool_call.name;
             toolNames.push(toolName);
             if (!tools.has(toolName)) {
@@ -473,7 +720,7 @@ export const formatAgentMessages = (
           // Check if this is a continuation of the tool sequence
           let isToolResponse = false;
           const content = payload[j].content;
-          if (content && Array.isArray(content)) {
+          if (content != null && Array.isArray(content)) {
             for (const part of content) {
               if (part.type === ContentTypes.TOOL_CALL) {
                 isToolResponse = true;
@@ -588,4 +835,91 @@ export function shiftIndexTokenCountMap(
   }
 
   return shiftedMap;
+}
+
+/**
+ * Ensures compatibility when switching from a non-thinking agent to a thinking-enabled agent.
+ * Converts AI messages with tool calls (that lack thinking/reasoning blocks) into buffer strings,
+ * avoiding the thinking block signature requirement.
+ *
+ * Recognizes the following as valid thinking/reasoning blocks:
+ * - ContentTypes.THINKING (Anthropic)
+ * - ContentTypes.REASONING_CONTENT (Bedrock)
+ * - ContentTypes.REASONING (VertexAI / Google)
+ * - 'redacted_thinking'
+ *
+ * @param messages - Array of messages to process
+ * @param provider - The provider being used (unused but kept for future compatibility)
+ * @returns The messages array with tool sequences converted to buffer strings if necessary
+ */
+export function ensureThinkingBlockInMessages(
+  messages: BaseMessage[],
+  _provider: Providers
+): BaseMessage[] {
+  const result: BaseMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const msg = messages[i];
+    const isAI = msg instanceof AIMessage || msg instanceof AIMessageChunk;
+
+    if (!isAI) {
+      result.push(msg);
+      i++;
+      continue;
+    }
+
+    const aiMsg = msg as AIMessage | AIMessageChunk;
+    const hasToolCalls = aiMsg.tool_calls && aiMsg.tool_calls.length > 0;
+    const contentIsArray = Array.isArray(aiMsg.content);
+
+    // Check if the message has tool calls or tool_use content
+    let hasToolUse = hasToolCalls ?? false;
+    let firstContentType: string | undefined;
+
+    if (contentIsArray && aiMsg.content.length > 0) {
+      const content = aiMsg.content as ExtendedMessageContent[];
+      firstContentType = content[0]?.type;
+      hasToolUse =
+        hasToolUse ||
+        content.some((c) => typeof c === 'object' && c.type === 'tool_use');
+    }
+
+    // If message has tool use but no thinking block, convert to buffer string
+    if (
+      hasToolUse &&
+      firstContentType !== ContentTypes.THINKING &&
+      firstContentType !== ContentTypes.REASONING_CONTENT &&
+      firstContentType !== ContentTypes.REASONING &&
+      firstContentType !== 'redacted_thinking'
+    ) {
+      // Collect the AI message and any following tool messages
+      const toolSequence: BaseMessage[] = [msg];
+      let j = i + 1;
+
+      // Look ahead for tool messages that belong to this AI message
+      while (j < messages.length && messages[j] instanceof ToolMessage) {
+        toolSequence.push(messages[j]);
+        j++;
+      }
+
+      // Convert the sequence to a buffer string and wrap in a HumanMessage
+      // This avoids the thinking block requirement which only applies to AI messages
+      const bufferString = getBufferString(toolSequence);
+      result.push(
+        new HumanMessage({
+          content: `[Previous agent context]\n${bufferString}`,
+        })
+      );
+
+      // Skip the messages we've processed
+      i = j;
+    } else {
+      // Keep the message as is
+      result.push(msg);
+      i++;
+    }
+  }
+
+  return result;
 }

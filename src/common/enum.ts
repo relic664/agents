@@ -19,6 +19,8 @@ export enum GraphEvents {
   ON_MESSAGE_DELTA = 'on_message_delta',
   /** [Custom] Reasoning Delta events for messages */
   ON_REASONING_DELTA = 'on_reasoning_delta',
+  /** [Custom] Request to execute tools - dispatched by ToolNode, handled by host */
+  ON_TOOL_EXECUTE = 'on_tool_execute',
 
   /* Official Events */
 
@@ -77,7 +79,6 @@ export enum Providers {
   ANTHROPIC = 'anthropic',
   MISTRALAI = 'mistralai',
   MISTRAL = 'mistral',
-  OLLAMA = 'ollama',
   GOOGLE = 'google',
   AZURE = 'azureOpenAI',
   DEEPSEEK = 'deepseek',
@@ -160,9 +161,13 @@ export enum Callback {
 export enum Constants {
   OFFICIAL_CODE_BASEURL = 'https://api.librechat.ai/v1',
   EXECUTE_CODE = 'execute_code',
+  TOOL_SEARCH = 'tool_search',
+  PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_code',
   WEB_SEARCH = 'web_search',
   CONTENT_AND_ARTIFACT = 'content_and_artifact',
   LC_TRANSFER_TO_ = 'lc_transfer_to_',
+  /** Delimiter for MCP tools: toolName_mcp_serverName */
+  MCP_DELIMITER = '_mcp_',
 }
 
 export enum TitleMethod {

@@ -35,9 +35,11 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  Constants,
 } from '@/common';
 import {
   formatAnthropicArtifactContent,
+  ensureThinkingBlockInMessages,
   convertMessagesToContent,
   addBedrockCacheControl,
   modifyDeltaProperties,
@@ -45,6 +47,7 @@ import {
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
+  extractToolDiscoveries,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -57,6 +60,7 @@ import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { HandlerRegistry } from '@/events';
@@ -96,7 +100,8 @@ export abstract class Graph<
   abstract getRunStep(stepId: string): t.RunStep | undefined;
   abstract dispatchRunStep(
     stepKey: string,
-    stepDetails: t.StepDetails
+    stepDetails: t.StepDetails,
+    metadata?: Record<string, unknown>
   ): Promise<string>;
   abstract dispatchRunStepDelta(
     id: string,
@@ -132,6 +137,12 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  /**
+   * Tool session contexts for automatic state persistence across tool invocations.
+   * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
+   * Currently supports code execution session tracking (session_id, files).
+   */
+  sessions: t.ToolSessionMap = new Map();
 }
 
 export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
@@ -327,6 +338,66 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return convertMessagesToContent(this.messages.slice(this.startIndex));
   }
 
+  /**
+   * Get all run steps, optionally filtered by agent ID
+   */
+  getRunSteps(agentId?: string): t.RunStep[] {
+    if (agentId == null || agentId === '') {
+      return [...this.contentData];
+    }
+    return this.contentData.filter((step) => step.agentId === agentId);
+  }
+
+  /**
+   * Get run steps grouped by agent ID
+   */
+  getRunStepsByAgent(): Map<string, t.RunStep[]> {
+    const stepsByAgent = new Map<string, t.RunStep[]>();
+
+    for (const step of this.contentData) {
+      if (step.agentId == null || step.agentId === '') continue;
+
+      const steps = stepsByAgent.get(step.agentId) ?? [];
+      steps.push(step);
+      stepsByAgent.set(step.agentId, steps);
+    }
+
+    return stepsByAgent;
+  }
+
+  /**
+   * Get agent IDs that participated in this run
+   */
+  getActiveAgentIds(): string[] {
+    const agentIds = new Set<string>();
+    for (const step of this.contentData) {
+      if (step.agentId != null && step.agentId !== '') {
+        agentIds.add(step.agentId);
+      }
+    }
+    return Array.from(agentIds);
+  }
+
+  /**
+   * Maps contentPart indices to agent IDs for post-run analysis
+   * Returns a map where key is the contentPart index and value is the agentId
+   */
+  getContentPartAgentMap(): Map<number, string> {
+    const contentPartAgentMap = new Map<number, string>();
+
+    for (const step of this.contentData) {
+      if (
+        step.agentId != null &&
+        step.agentId !== '' &&
+        Number.isFinite(step.index)
+      ) {
+        contentPartAgentMap.set(step.index, step.agentId);
+      }
+    }
+
+    return contentPartAgentMap;
+  }
+
   /* Graph */
 
   createSystemRunnable({
@@ -353,11 +424,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       finalInstructions != null &&
       finalInstructions &&
       provider === Providers.ANTHROPIC &&
-      ((
-        (clientOptions as t.AnthropicClientOptions).clientOptions
-          ?.defaultHeaders as Record<string, string> | undefined
-      )?.['anthropic-beta']?.includes('prompt-caching') ??
-        false)
+      (clientOptions as t.AnthropicClientOptions).promptCache === true
     ) {
       finalInstructions = {
         content: [
@@ -381,16 +448,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   initializeTools({
     currentTools,
     currentToolMap,
+    agentContext,
   }: {
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
+    agentContext?: AgentContext;
   }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
+    const toolDefinitions = agentContext?.toolDefinitions;
+    const eventDrivenMode =
+      toolDefinitions != null && toolDefinitions.length > 0;
+
+    if (eventDrivenMode) {
+      const schemaTools = createSchemaOnlyTools(toolDefinitions);
+      const toolDefMap = new Map(toolDefinitions.map((def) => [def.name, def]));
+
+      return new CustomToolNode<t.BaseGraphState>({
+        tools: schemaTools as t.GenericTool[],
+        toolMap: new Map(schemaTools.map((tool) => [tool.name, tool])),
+        toolCallStepIds: this.toolCallStepIds,
+        errorHandler: (data, metadata) =>
+          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
+        toolRegistry: agentContext?.toolRegistry,
+        sessions: this.sessions,
+        eventDrivenMode: true,
+        toolDefinitions: toolDefMap,
+        agentId: agentContext?.agentId,
+      });
+    }
+
     return new CustomToolNode<t.BaseGraphState>({
       tools: (currentTools as t.GenericTool[] | undefined) ?? [],
       toolMap: currentToolMap,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
+      toolRegistry: agentContext?.toolRegistry,
+      sessions: this.sessions,
     });
   }
 
@@ -541,7 +634,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     client.abortHandler = undefined;
   }
 
-  createCallModel(agentId = 'default', currentModel?: t.ChatModel) {
+  createCallModel(agentId = 'default') {
     return async (
       state: t.BaseGraphState,
       config?: RunnableConfig
@@ -554,15 +647,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
       }
 
-      const model = this.overrideModel ?? currentModel;
-      if (!model) {
-        throw new Error('No Graph model found');
-      }
       if (!config) {
         throw new Error('No config provided');
       }
 
-      // Ensure token calculations are complete before proceeding
+      const { messages } = state;
+
+      // Extract tool discoveries from current turn only (similar to formatArtifactPayload pattern)
+      const discoveredNames = extractToolDiscoveries(messages);
+      if (discoveredNames.length > 0) {
+        agentContext.markToolsAsDiscovered(discoveredNames);
+      }
+
+      const toolsForBinding = agentContext.getToolsForBinding();
+      let model =
+        this.overrideModel ??
+        this.initializeModel({
+          tools: toolsForBinding,
+          provider: agentContext.provider,
+          clientOptions: agentContext.clientOptions,
+        });
+
+      if (agentContext.systemRunnable) {
+        model = agentContext.systemRunnable.pipe(model as Runnable);
+      }
+
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
@@ -570,7 +679,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         config.signal = this.signal;
       }
       this.config = config;
-      const { messages } = state;
 
       let messagesToUse = messages;
       if (
@@ -643,7 +751,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
         isLatestToolMessage &&
-        (isOpenAILike(agentContext.provider) ||
+        ((isOpenAILike(agentContext.provider) &&
+          agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
       ) {
         formatArtifactPayload(finalMessages);
@@ -653,14 +762,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const anthropicOptions = agentContext.clientOptions as
           | t.AnthropicClientOptions
           | undefined;
-        const defaultHeaders = anthropicOptions?.clientOptions
-          ?.defaultHeaders as Record<string, string> | undefined;
-        const anthropicBeta = defaultHeaders?.['anthropic-beta'];
-
-        if (
-          typeof anthropicBeta === 'string' &&
-          anthropicBeta.includes('prompt-caching')
-        ) {
+        if (anthropicOptions?.promptCache === true) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.BEDROCK) {
@@ -670,6 +772,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (bedrockOptions?.promptCache === true) {
           finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
         }
+      }
+
+      /**
+       * Handle edge case: when switching from a non-thinking agent to a thinking-enabled agent,
+       * convert AI messages with tool calls to HumanMessages to avoid thinking block requirements.
+       * This is required by Anthropic/Bedrock when thinking is enabled.
+       */
+      const isAnthropicWithThinking =
+        (agentContext.provider === Providers.ANTHROPIC &&
+          (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
+            null) ||
+        (agentContext.provider === Providers.BEDROCK &&
+          (agentContext.clientOptions as t.BedrockAnthropicInput)
+            .additionalModelRequestFields?.['thinking'] != null);
+
+      if (isAnthropicWithThinking) {
+        finalMessages = ensureThinkingBlockInMessages(
+          finalMessages,
+          agentContext.provider
+        );
       }
 
       if (
@@ -691,6 +813,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const fallbacks =
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
+
+      if (finalMessages.length === 0) {
+        throw new Error(
+          JSON.stringify({
+            type: 'empty_messages',
+            info: 'Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.',
+          })
+        );
+      }
+
       try {
         result = await this.attemptInvoke(
           {
@@ -751,16 +883,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
 
-    let currentModel = this.initializeModel({
-      tools: agentContext.tools,
-      provider: agentContext.provider,
-      clientOptions: agentContext.clientOptions,
-    });
-
-    if (agentContext.systemRunnable) {
-      currentModel = agentContext.systemRunnable.pipe(currentModel);
-    }
-
     const agentNode = `${AGENT}${agentId}` as const;
     const toolNode = `${TOOLS}${agentId}` as const;
 
@@ -780,12 +902,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
 
     const workflow = new StateGraph(StateAnnotation)
-      .addNode(agentNode, this.createCallModel(agentId, currentModel))
+      .addNode(agentNode, this.createCallModel(agentId))
       .addNode(
         toolNode,
         this.initializeTools({
           currentTools: agentContext.tools,
           currentToolMap: agentContext.toolMap,
+          agentContext,
         })
       )
       .addEdge(START, agentNode)
@@ -820,6 +943,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return workflow;
   }
 
+  /**
+   * Indicates if this is a multi-agent graph.
+   * Override in MultiAgentGraph to return true.
+   * Used to conditionally include agentId in RunStep for frontend rendering.
+   */
+  protected isMultiAgentGraph(): boolean {
+    return false;
+  }
+
+  /**
+   * Get the parallel group ID for an agent, if any.
+   * Override in MultiAgentGraph to provide actual group IDs.
+   * Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order.
+   * @param _agentId - The agent ID to look up
+   * @returns undefined for StandardGraph (no parallel groups), or group number for MultiAgentGraph
+   */
+  protected getParallelGroupIdForAgent(_agentId: string): number | undefined {
+    return undefined;
+  }
+
   /* Dispatchers */
 
   /**
@@ -827,7 +970,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   async dispatchRunStep(
     stepKey: string,
-    stepDetails: t.StepDetails
+    stepDetails: t.StepDetails,
+    metadata?: Record<string, unknown>
   ): Promise<string> {
     if (!this.config) {
       throw new Error('No config provided');
@@ -856,6 +1000,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runId = this.runId ?? '';
     if (runId) {
       runStep.runId = runId;
+    }
+
+    /**
+     * Extract agentId and parallelGroupId from metadata
+     * Only set agentId for MultiAgentGraph (so frontend knows when to show agent labels)
+     */
+    if (metadata) {
+      try {
+        const agentContext = this.getAgentContext(metadata);
+        if (this.isMultiAgentGraph() && agentContext.agentId) {
+          // Only include agentId for MultiAgentGraph - enables frontend to show agent labels
+          runStep.agentId = agentContext.agentId;
+          // Set group ID if this agent is part of a parallel group
+          // Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order
+          const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
+          if (groupId != null) {
+            runStep.groupId = groupId;
+          }
+        }
+      } catch (_e) {
+        /** If we can't get agent context, that's okay - agentId remains undefined */
+      }
     }
 
     this.contentData.push(runStep);
@@ -895,6 +1061,60 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runStep = this.getRunStep(stepId);
     if (!runStep) {
       throw new Error(`No run step found for stepId ${stepId}`);
+    }
+
+    /**
+     * Extract and store code execution session context from artifacts.
+     * Each file is stamped with its source session_id to support multi-session file tracking.
+     * When the same filename appears in a later execution, the newer version replaces the old.
+     */
+    const toolName = output.name;
+    if (
+      toolName === Constants.EXECUTE_CODE ||
+      toolName === Constants.PROGRAMMATIC_TOOL_CALLING
+    ) {
+      const artifact = output.artifact as t.CodeExecutionArtifact | undefined;
+      const newFiles = artifact?.files ?? [];
+      const hasNewFiles = newFiles.length > 0;
+
+      if (
+        hasNewFiles &&
+        artifact?.session_id != null &&
+        artifact.session_id !== ''
+      ) {
+        /**
+         * Stamp each new file with its source session_id.
+         * This enables files from different executions (parallel or sequential)
+         * to be tracked and passed to subsequent calls.
+         */
+        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+          ...file,
+          session_id: artifact.session_id,
+        }));
+
+        const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
+          | t.CodeSessionContext
+          | undefined;
+        const existingFiles = existingSession?.files ?? [];
+
+        /**
+         * Merge files, preferring latest versions by name.
+         * If a file with the same name exists, replace it with the new version.
+         * This handles cases where files are edited/recreated in subsequent executions.
+         */
+        const newFileNames = new Set(filesWithSession.map((f) => f.name));
+        const filteredExisting = existingFiles.filter(
+          (f) => !newFileNames.has(f.name)
+        );
+
+        this.sessions.set(Constants.EXECUTE_CODE, {
+          /** Keep latest session_id for reference/fallback */
+          session_id: artifact.session_id,
+          /** Accumulated files with latest versions preferred */
+          files: [...filteredExisting, ...filesWithSession],
+          lastUpdated: Date.now(),
+        });
+      }
     }
 
     const dispatchedOutput =
