@@ -103,7 +103,9 @@
     "reinstall": "npm run clean && npm ci && rm -rf ./dist && npm run build",
     "re": "bun run clean && bun install && rm -rf ./dist && turbo build",
     "lint": "eslint \"{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}\" --fix",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "postinstall": "node -e \"if (process.env.INIT_CWD === process.cwd()) require('./husky-setup.js')\"",
+
   },
   "overrides": {
     "@langchain/openai": "0.5.18",
