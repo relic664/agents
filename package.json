@@ -104,7 +104,7 @@
     "re": "bun run clean && bun install && rm -rf ./dist && turbo build",
     "lint": "eslint \"{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}\" --fix",
     "format": "prettier --write .",
-    "postinstall": "node -e \"if (process.env.INIT_CWD === process.cwd()) require('./husky-setup.js')\"",
+    "postinstall": "node -e \"if (process.env.INIT_CWD === process.cwd()) require('./husky-setup.js')\""
 
   },
   "overrides": {
