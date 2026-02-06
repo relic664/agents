@@ -47,6 +47,8 @@ export type ToolNodeOptions = {
   toolDefinitions?: Map<string, LCTool>;
   /** Agent ID for event-driven mode (used to identify which agent's context to use) */
   agentId?: string;
+  /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
+  directToolNames?: Set<string>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -193,6 +195,9 @@ export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
 export type ToolSearchMode = 'code_interpreter' | 'local';
 
+/** Format for MCP tool names in search results */
+export type McpNameFormat = 'full' | 'base';
+
 /** Parameters for creating a Tool Search tool */
 export type ToolSearchParams = {
   apiKey?: string;
@@ -203,6 +208,8 @@ export type ToolSearchParams = {
   mode?: ToolSearchMode;
   /** Filter tools to only those from specific MCP server(s). Can be a single name or array of names. */
   mcpServer?: string | string[];
+  /** Format for MCP tool names: 'full' (tool_mcp_server) or 'base' (tool only). Default: 'full' */
+  mcpNameFormat?: McpNameFormat;
   [key: string]: unknown;
 };
 
